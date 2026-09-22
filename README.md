@@ -43,6 +43,7 @@ pytest tests/ -q
 | `POST` | `/v1/recognize` | 候选字识别：未标注轨迹 → top-k 候选 |
 | `POST` | `/v1/validate` | 校验一次书写提交（幂等） |
 | `GET` | `/v1/submissions/{submission_id}` | 按幂等键查询历史结果 |
+| `GET` | `/v1/analytics/practice` | 书写练习质量趋势（聚合已保存提交） |
 
 ### 示例：候选字识别
 
@@ -181,6 +182,68 @@ curl -X POST http://localhost:8000/v1/validate \
 | `DIRECTION_DEVIATION` | 运笔方向偏差超限 |
 | `SHAPE_DEVIATION` | 笔画形状偏差超限 |
 
+### 示例：书写练习质量趋势
+
+`GET /v1/analytics/practice` 在**单个一致性快照**中筛选已保存的校验提交并聚合：
+
+```bash
+curl -G http://localhost:8000/v1/analytics/practice \
+  --data-urlencode 'character=十' \
+  --data-urlencode 'start=2026-09-01T00:00:00Z' \
+  --data-urlencode 'end=2026-09-30T23:59:59Z' \
+  --data-urlencode 'passed=true'        # 可选：只看合格/不合格提交
+```
+
+查询参数：
+
+| 参数 | 必填 | 说明 |
+| --- | --- | --- |
+| `character` | 是 | 目标汉字（单个字符） |
+| `start` | 是 | 起始时刻（ISO-8601，含），朴素时间按 UTC 处理 |
+| `end` | 是 | 结束时刻（ISO-8601，含），朴素时间按 UTC 处理；早于 `start` 返回 `422` |
+| `passed` | 否 | `true` / `false`：仅统计合格或不合格提交；缺省不筛选 |
+
+时间区间为**闭区间**（`start`、`end` 时刻本身都计入），带偏移的时间戳会先归一化为 UTC。
+响应回显实际生效的筛选条件与报告生成时间：
+
+```json
+{
+  "filter": {
+    "character": "十",
+    "start": "2026-09-01T00:00:00+00:00",
+    "end": "2026-09-30T23:59:59+00:00",
+    "passed": null
+  },
+  "total_submissions": 4,
+  "passed_submissions": 2,
+  "pass_rate": 0.5,
+  "average_score": 82.5,
+  "p50_score": 90.0,
+  "p90_score": 100.0,
+  "first_failed_stroke_distribution": [
+    {"stroke_index": 0, "count": 1},
+    {"stroke_index": 1, "count": 1}
+  ],
+  "daily": [
+    {"date": "2026-09-20", "total": 2, "passed": 2,
+     "pass_rate": 1.0, "average_score": 100.0},
+    {"date": "2026-09-21", "total": 2, "passed": 0,
+     "pass_rate": 0.0, "average_score": 65.0}
+  ],
+  "generated_at": "2026-09-22T03:10:00+00:00"
+}
+```
+
+- `p50_score` / `p90_score`：分数分位数，采用**显式线性插值**——
+  对升序样本 x₀..xₙ₋₁，百分位 p 的秩为 `h = p/100·(n-1)`，
+  在 `x_⌊h⌋` 与 `x_⌈h⌉` 之间按 `h - ⌊h⌋` 线性插值（与 numpy 默认 `linear` 方法一致）。
+- `first_failed_stroke_distribution`：仅统计失败提交中**首个**不合格笔画的下标
+  （0 起，`STROKE_COUNT_MISMATCH` 时为首个未写笔画的下标），按下标升序。
+- `daily`：按 **UTC 日期**（`YYYY-MM-DD`）分桶，仅有提交的日期出现、日期升序，
+  每桶给出提交数、合格数、通过率与平均分。
+- 没有任何匹配提交时，计数/比率/分数字段均为零值（`0` / `0.0`），
+  `first_failed_stroke_distribution` 与 `daily` 为空数组。
+
 ## 匹配算法
 
 1. **归一化**：以参考字外接框（扩成正方形 + 5% 边距）做仿射变换映射到 `0..1` 区间，
@@ -262,13 +325,14 @@ curl -X POST http://localhost:8000/v1/validate \
 
 ```
 app/
-├── main.py        # FastAPI 应用与路由（识别 + 幂等校验流程）
+├── main.py        # FastAPI 应用与路由（识别 + 幂等校验 + 练习趋势）
 ├── models.py      # Pydantic 请求/响应模型
+├── analytics.py   # 练习趋势聚合（线性插值分位 + 首败笔画分布 + UTC 日桶）
 ├── recognition.py # 候选字识别引擎（代价矩阵 + 匈牙利全局一对一分配 + 缺/多笔惩罚）
 ├── validation.py  # 笔顺匹配引擎（方向/起止点/形状/错序/计分）
 ├── geometry.py    # 归一化、重采样、拐点检测
-├── db.py          # SQLite 持久化（参考字 + 幂等提交）
+├── db.py          # SQLite 持久化（参考字 + 幂等提交 + 一致性快照）
 └── config.py      # 环境变量配置
-tests/test_api.py  # 31 个端到端用例
+tests/test_api.py  # 端到端用例
 Dockerfile / docker-compose.yml
 ```

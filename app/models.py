@@ -212,3 +212,60 @@ class SubmissionRecord(BaseModel):
     request_hash: str
     result: ValidateResponse
     created_at: str
+
+
+# ------------------------------------------------------------ 练习质量趋势
+
+class PracticeFilter(BaseModel):
+    """趋势接口实际生效的筛选条件回显。"""
+
+    character: str = Field(description="目标汉字（精确匹配）")
+    start: str = Field(description="起始时刻（UTC ISO-8601，闭区间）")
+    end: str = Field(description="结束时刻（UTC ISO-8601，闭区间）")
+    passed: Optional[bool] = Field(
+        default=None, description="合格状态筛选；null 表示不筛选",
+    )
+
+
+class FirstFailedStrokeCount(BaseModel):
+    stroke_index: int = Field(description="首个不合格笔画下标（0 起）")
+    count: int = Field(ge=0, description="以该笔为首个失败笔画的提交数")
+
+
+class PracticeDailyBucket(BaseModel):
+    """单个 UTC 日期（YYYY-MM-DD）的练习聚合；仅有提交的日期出现。"""
+
+    date: str
+    total: int = Field(ge=0)
+    passed: int = Field(ge=0)
+    pass_rate: float = Field(ge=0.0, le=1.0)
+    average_score: float = Field(ge=0.0, le=100.0)
+
+
+class PracticeAnalyticsResponse(BaseModel):
+    filter: PracticeFilter
+    total_submissions: int = Field(
+        ge=0, description="筛选范围内的提交数；空结果为 0",
+    )
+    passed_submissions: int = Field(ge=0, description="其中合格的提交数")
+    pass_rate: float = Field(
+        ge=0.0, le=1.0, description="通过率 = 合格数 / 提交数；空结果为 0.0",
+    )
+    average_score: float = Field(
+        ge=0.0, le=100.0, description="平均得分；空结果为 0.0",
+    )
+    p50_score: float = Field(
+        ge=0.0, le=100.0,
+        description="分数 P50（中位数，线性插值）；空结果为 0.0",
+    )
+    p90_score: float = Field(
+        ge=0.0, le=100.0,
+        description="分数 P90（线性插值）；空结果为 0.0",
+    )
+    first_failed_stroke_distribution: list[FirstFailedStrokeCount] = Field(
+        description="首个失败笔画下标分布（仅失败提交），按下标升序",
+    )
+    daily: list[PracticeDailyBucket] = Field(
+        description="按 UTC 日期分桶的趋势，日期升序；空结果为空数组",
+    )
+    generated_at: str = Field(description="报告生成时刻（UTC ISO-8601）")

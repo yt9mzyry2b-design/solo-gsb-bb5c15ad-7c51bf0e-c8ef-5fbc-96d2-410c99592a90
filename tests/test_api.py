@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import importlib
+import json
 import os
+import sqlite3
 
 import pytest
 from fastapi.testclient import TestClient
@@ -22,6 +24,22 @@ def client(tmp_path, monkeypatch):
 
     with TestClient(main.app) as c:
         yield c
+
+
+@pytest.fixture()
+def client_db(tmp_path, monkeypatch):
+    """同 client，额外暴露数据库路径，便于直接构造带固定时间戳的提交。"""
+    db_path = tmp_path / "test.db"
+    monkeypatch.setenv("DATABASE_PATH", str(db_path))
+
+    import app.config as config
+    importlib.reload(config)
+
+    import app.main as main
+    importlib.reload(main)
+
+    with TestClient(main.app) as c:
+        yield c, db_path
 
 
 # “十”：横 + 竖，画布 400x400
@@ -393,3 +411,301 @@ def test_recognize_tie_break_is_stable(client):
     tied = [c["character"] for c in r1.json()["candidates"]
             if c["score"] == top_score]
     assert tied == ["乙", "十"]
+
+
+# ------------------------------------------------------------------ 练习质量趋势
+
+def _seed_submission(db_path, sid, character, passed, score, created_at,
+                     first_failed=None):
+    """直接向 SQLite 写入带固定 UTC 时间戳的提交记录（绕过真实时间）。"""
+    response = {
+        "submission_id": sid,
+        "character": character,
+        "passed": passed,
+        "score": score,
+        "expected_stroke_count": 2,
+        "actual_stroke_count": 2,
+        "first_failed_stroke": first_failed,
+        "deviation": None,
+        "strokes": [],
+        "idempotent_replay": False,
+        "created_at": created_at,
+    }
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO submissions (submission_id, request_hash, response,"
+            " created_at) VALUES (?, ?, ?, ?)",
+            (sid, f"hash-{sid}", json.dumps(response), created_at),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# “十”：2 合格 + 2 失败，分数 100/100/80/50，分布在两个 UTC 日期
+SHI_SEEDS = [
+    ("s1", "十", True, 100.0, "2026-09-20T01:00:00+00:00", None),
+    ("s2", "十", True, 100.0, "2026-09-20T08:30:00+00:00", None),
+    ("s3", "十", False, 80.0, "2026-09-21T02:00:00+00:00", 0),
+    ("s4", "十", False, 50.0, "2026-09-21T09:15:00+00:00", 1),
+]
+# 区间外（时间过晚）与其他字符的噪声数据
+NOISE_SEEDS = [
+    ("s-late", "十", True, 100.0, "2026-09-22T00:00:01+00:00", None),
+    ("s-yi", "一", False, 10.0, "2026-09-20T12:00:00+00:00", 0),
+]
+
+
+def _seed_shi_fixture(db_path):
+    for row in SHI_SEEDS + NOISE_SEEDS:
+        _seed_submission(db_path, *row)
+
+
+def _practice_url(**params):
+    from urllib.parse import urlencode
+
+    return "/v1/analytics/practice?" + urlencode(params)
+
+
+def test_practice_empty_window_returns_zero_values(client_db):
+    client, db_path = client_db
+    _seed_submission(db_path, "only", "十", True, 90.0,
+                     "2026-09-19T00:00:00+00:00")
+    r = client.get(_practice_url(
+        character="十",
+        start="2026-09-20T00:00:00+00:00",
+        end="2026-09-21T00:00:00+00:00",
+    ))
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total_submissions"] == 0
+    assert body["passed_submissions"] == 0
+    assert body["pass_rate"] == 0.0
+    assert body["average_score"] == 0.0
+    assert body["p50_score"] == 0.0
+    assert body["p90_score"] == 0.0
+    assert body["first_failed_stroke_distribution"] == []
+    assert body["daily"] == []
+    assert body["filter"] == {
+        "character": "十",
+        "start": "2026-09-20T00:00:00+00:00",
+        "end": "2026-09-21T00:00:00+00:00",
+        "passed": None,
+    }
+    assert body["generated_at"].endswith("+00:00")
+
+
+def test_practice_aggregates_scores_distribution_and_daily(client_db):
+    client, db_path = client_db
+    _seed_shi_fixture(db_path)
+    r = client.get(_practice_url(
+        character="十",
+        start="2026-09-20T00:00:00+00:00",
+        end="2026-09-21T23:59:59+00:00",
+    ))
+    assert r.status_code == 200
+    body = r.json()
+    # 过滤：仅 4 条“十”，噪声（其他字符/区间外）被剔除
+    assert body["total_submissions"] == 4
+    assert body["passed_submissions"] == 2
+    assert body["pass_rate"] == 0.5
+    assert body["average_score"] == 82.5
+    # 分数升序 [50, 80, 100, 100]：P50 秩 1.5、P90 秩 2.7（线性插值）
+    assert body["p50_score"] == 90.0
+    assert body["p90_score"] == 100.0
+    assert body["first_failed_stroke_distribution"] == [
+        {"stroke_index": 0, "count": 1},
+        {"stroke_index": 1, "count": 1},
+    ]
+    assert body["daily"] == [
+        {"date": "2026-09-20", "total": 2, "passed": 2,
+         "pass_rate": 1.0, "average_score": 100.0},
+        {"date": "2026-09-21", "total": 2, "passed": 0,
+         "pass_rate": 0.0, "average_score": 65.0},
+    ]
+
+
+def test_practice_filter_passed_true(client_db):
+    client, db_path = client_db
+    _seed_shi_fixture(db_path)
+    r = client.get(_practice_url(
+        character="十",
+        start="2026-09-20T00:00:00+00:00",
+        end="2026-09-21T23:59:59+00:00",
+        passed="true",
+    ))
+    body = r.json()
+    assert body["filter"]["passed"] is True
+    assert body["total_submissions"] == 2
+    assert body["passed_submissions"] == 2
+    assert body["pass_rate"] == 1.0
+    assert body["average_score"] == 100.0
+    assert body["p50_score"] == 100.0
+    assert body["p90_score"] == 100.0
+    assert body["first_failed_stroke_distribution"] == []
+    assert [b["date"] for b in body["daily"]] == ["2026-09-20"]
+
+
+def test_practice_filter_passed_false(client_db):
+    client, db_path = client_db
+    _seed_shi_fixture(db_path)
+    r = client.get(_practice_url(
+        character="十",
+        start="2026-09-20T00:00:00+00:00",
+        end="2026-09-21T23:59:59+00:00",
+        passed="false",
+    ))
+    body = r.json()
+    assert body["filter"]["passed"] is False
+    assert body["total_submissions"] == 2
+    assert body["passed_submissions"] == 0
+    assert body["pass_rate"] == 0.0
+    assert body["average_score"] == 65.0
+    # [50, 80]：P50 秩 0.5 → 65；P90 秩 0.9 → 77
+    assert body["p50_score"] == 65.0
+    assert body["p90_score"] == 77.0
+    assert body["first_failed_stroke_distribution"] == [
+        {"stroke_index": 0, "count": 1},
+        {"stroke_index": 1, "count": 1},
+    ]
+    assert [b["date"] for b in body["daily"]] == ["2026-09-21"]
+
+
+def test_practice_closed_interval_includes_both_endpoints(client_db):
+    client, db_path = client_db
+    _seed_shi_fixture(db_path)
+    r = client.get(_practice_url(
+        character="十",
+        start="2026-09-20T01:00:00+00:00",
+        end="2026-09-21T02:00:00+00:00",
+    ))
+    body = r.json()
+    # 恰好在起止边界上的 s1、s3 均计入；s4(09:15) 与 s-late 不计入
+    assert body["total_submissions"] == 3
+    assert [b["date"] for b in body["daily"]] == ["2026-09-20", "2026-09-21"]
+    assert body["daily"][1]["total"] == 1
+
+
+def test_practice_other_character_excluded(client_db):
+    client, db_path = client_db
+    _seed_shi_fixture(db_path)
+    r = client.get(_practice_url(
+        character="一",
+        start="2026-09-01T00:00:00+00:00",
+        end="2026-09-30T00:00:00+00:00",
+    ))
+    body = r.json()
+    assert body["total_submissions"] == 1
+    assert body["passed_submissions"] == 0
+    assert body["average_score"] == 10.0
+    assert body["first_failed_stroke_distribution"] == [
+        {"stroke_index": 0, "count": 1}
+    ]
+
+
+def test_practice_timezone_offset_normalized_to_utc(client_db):
+    client, db_path = client_db
+    _seed_submission(db_path, "tz", "十", True, 70.0,
+                     "2026-09-20T10:00:00+00:00")
+    # 北京时间 18:00 (+08:00) == UTC 10:00；闭区间边界应命中
+    r = client.get(_practice_url(
+        character="十",
+        start="2026-09-20T17:00:00+08:00",
+        end="2026-09-20T18:00:00+08:00",
+    ))
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total_submissions"] == 1
+    assert body["average_score"] == 70.0
+    # 筛选条件统一回显为 UTC
+    assert body["filter"]["start"] == "2026-09-20T09:00:00+00:00"
+    assert body["filter"]["end"] == "2026-09-20T10:00:00+00:00"
+    # UTC 分桶（而非 +08:00 的 9 月 20 日以外日期；此处同日但验证桶键）
+    assert body["daily"][0]["date"] == "2026-09-20"
+
+
+def test_practice_naive_datetime_treated_as_utc(client_db):
+    client, db_path = client_db
+    _seed_submission(db_path, "naive", "十", True, 60.0,
+                     "2026-09-20T10:00:00+00:00")
+    r = client.get(_practice_url(
+        character="十",
+        start="2026-09-20T10:00:00",
+        end="2026-09-20T10:00:00",
+    ))
+    assert r.status_code == 200
+    assert r.json()["total_submissions"] == 1
+
+
+def test_practice_daily_utc_bucketing(client_db):
+    client, db_path = client_db
+    # 北京时间 9 月 21 日 08:00 == UTC 9 月 21 日 00:00（闭区间起点）
+    _seed_submission(db_path, "utc-a", "十", True, 90.0,
+                     "2026-09-20T23:59:59+00:00")
+    _seed_submission(db_path, "utc-b", "十", False, 40.0,
+                     "2026-09-21T00:00:00+00:00")
+    r = client.get(_practice_url(
+        character="十",
+        start="2026-09-20T00:00:00+00:00",
+        end="2026-09-22T00:00:00+00:00",
+    ))
+    daily = r.json()["daily"]
+    assert [b["date"] for b in daily] == ["2026-09-20", "2026-09-21"]
+    assert daily[0]["total"] == 1
+    assert daily[1]["total"] == 1
+
+
+def test_practice_missing_params_422(client):
+    r = client.get(_practice_url(character="十",
+                                end="2026-09-21T00:00:00+00:00"))
+    assert r.status_code == 422
+
+
+def test_practice_bad_datetime_422(client):
+    r = client.get(_practice_url(
+        character="十", start="not-a-date",
+        end="2026-09-21T00:00:00+00:00",
+    ))
+    assert r.status_code == 422
+
+
+def test_practice_start_after_end_422(client):
+    r = client.get(_practice_url(
+        character="十",
+        start="2026-09-21T10:00:00+00:00",
+        end="2026-09-20T10:00:00+00:00",
+    ))
+    assert r.status_code == 422
+
+
+def test_practice_character_must_be_single_char(client):
+    r = client.get(_practice_url(
+        character="汉字",
+        start="2026-09-20T00:00:00+00:00",
+        end="2026-09-21T00:00:00+00:00",
+    ))
+    assert r.status_code == 422
+
+
+def test_practice_end_to_end_with_real_validate(client):
+    """走真实 /v1/validate 落库，再用趋势接口聚合（时间窗覆盖当天）。"""
+    client.post("/v1/validate", json=_validate_payload("a-ok", PERFECT_SHI))
+    client.post("/v1/validate",
+                json=_validate_payload("a-fail", [REF_SHI[0]]))
+    r = client.get(_practice_url(
+        character="十",
+        start="2000-01-01T00:00:00+00:00",
+        end="2100-01-01T00:00:00+00:00",
+    ))
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total_submissions"] == 2
+    assert body["passed_submissions"] == 1
+    assert body["pass_rate"] == 0.5
+    assert body["average_score"] == 75.0  # 100 与 50
+    # 缺笔失败提交的首个失败笔画下标为 1（两笔参考中缺失的第 2 笔）
+    assert body["first_failed_stroke_distribution"] == [
+        {"stroke_index": 1, "count": 1}
+    ]
+    assert len(body["daily"]) == 1

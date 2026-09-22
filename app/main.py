@@ -5,12 +5,15 @@ import hashlib
 import json
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from typing import Optional
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Query, status
 
 from . import __version__, db as db_module
+from . import analytics
 from .config import settings
 from .models import (
+    PracticeAnalyticsResponse,
     RecognitionCandidate,
     RecognizeRequest,
     RecognizeResponse,
@@ -266,3 +269,51 @@ def get_submission(submission_id: str, db: db_module.Database = Depends(get_db))
         "result": record["response"],
         "created_at": record["created_at"],
     }
+
+
+# ------------------------------------------------------------------ 练习趋势
+
+@app.get(
+    "/v1/analytics/practice",
+    response_model=PracticeAnalyticsResponse,
+    tags=["analytics"],
+)
+def practice_analytics(
+    character: str = Query(
+        min_length=1, max_length=1, description="目标汉字（单个字符）",
+    ),
+    start: datetime = Query(
+        description="起始时刻（ISO-8601，含；朴素时间按 UTC 处理）",
+    ),
+    end: datetime = Query(
+        description="结束时刻（ISO-8601，含；朴素时间按 UTC 处理）",
+    ),
+    passed: Optional[bool] = Query(
+        default=None, description="可选：仅看合格（true）/不合格（false）提交",
+    ),
+    db: db_module.Database = Depends(get_db),
+):
+    """书写练习质量趋势。
+
+    在**单个一致性快照**中筛选已保存的校验提交（按 character 精确匹配、
+    时间**闭区间** [start, end] 及可选 passed 状态），返回提交数、通过率、
+    平均分、P50/P90 分数（显式线性插值）、首个失败笔画分布与按 UTC 日期
+    分桶的趋势。没有任何匹配提交时，统计字段为零值、分布与趋势为空数组。
+    """
+    # 朴素时间统一按 UTC 处理，避免与带时区输入比较时报错
+    start_utc = start if start.tzinfo is not None else start.replace(tzinfo=timezone.utc)
+    end_utc = end if end.tzinfo is not None else end.replace(tzinfo=timezone.utc)
+    if start_utc > end_utc:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="start 不能晚于 end",
+        )
+
+    snapshot = db.snapshot_submissions()
+    return analytics.build_practice_report(
+        snapshot=snapshot,
+        character=character,
+        start=start_utc,
+        end=end_utc,
+        passed=passed,
+    )

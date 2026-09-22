@@ -125,6 +125,30 @@ class Database:
             "created_at": row["created_at"],
         }
 
+    def snapshot_submissions(self) -> list[dict]:
+        """在单个一致性快照中读取全部提交记录（一次加锁 + 单一查询）。
+
+        返回结果按创建时间、幂等键升序；调用方可在快照之外安全地做过滤与
+        聚合，统计过程中即便有新提交落库也不会混入本次结果。
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT submission_id, request_hash, response, created_at
+                FROM submissions
+                ORDER BY created_at ASC, submission_id ASC
+                """
+            ).fetchall()
+        return [
+            {
+                "submission_id": row["submission_id"],
+                "request_hash": row["request_hash"],
+                "response": json.loads(row["response"]),
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
+
     def save_submission(
         self, submission_id: str, request_hash: str, response: dict
     ) -> tuple[dict, bool]:
