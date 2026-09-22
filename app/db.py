@@ -7,7 +7,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 _SCHEMA = """
@@ -29,6 +29,13 @@ CREATE TABLE IF NOT EXISTS submissions (
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _as_naive_utc(dt: datetime) -> datetime:
+    """带时区的时间换算为 naive UTC；naive 时间直接返回（落库时间即 UTC）。"""
+    if dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
 
 
 class Database:
@@ -125,14 +132,70 @@ class Database:
             "created_at": row["created_at"],
         }
 
+    def snapshot_submissions(
+        self,
+        character: str,
+        start: datetime,
+        end: datetime,
+        passed: Optional[bool],
+    ) -> list[dict]:
+        """在单个加锁读取（一致性快照）中筛选已保存的校验提交。
+
+        - character 精确匹配响应负载中的目标字；
+        - created_at 落在 [start, end] 闭区间（统一按 UTC 比较）；
+        - passed 为 None 时不筛通过状态。
+
+        时间先以秒级 ISO 字符串做宽松粗筛（粗筛区间外扩一秒并放开秒以下
+        精度），精确闭区间判定在解析后于内存完成，避免不同精度/时区写法
+        带来的字符串比较边界问题。结果按 created_at、submission_id 升序。
+        """
+        lo = _as_naive_utc(start).replace(microsecond=0).isoformat()
+        hi_dt = _as_naive_utc(end).replace(microsecond=0)
+        hi = (hi_dt + timedelta(seconds=1)).isoformat()
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM submissions
+                WHERE created_at >= ? AND created_at <= ?
+                ORDER BY created_at ASC, submission_id ASC
+                """,
+                (lo, hi),
+            ).fetchall()
+
+        records = []
+        for row in rows:
+            response = json.loads(row["response"])
+            if response.get("character") != character:
+                continue
+            if passed is not None and bool(response.get("passed")) is not passed:
+                continue
+            created_at = datetime.fromisoformat(row["created_at"])
+            created_at = _as_naive_utc(created_at)
+            if not (_as_naive_utc(start) <= created_at <= _as_naive_utc(end)):
+                continue
+            records.append(
+                {
+                    "submission_id": row["submission_id"],
+                    "request_hash": row["request_hash"],
+                    "response": response,
+                    "created_at": row["created_at"],
+                }
+            )
+        return records
+
     def save_submission(
-        self, submission_id: str, request_hash: str, response: dict
+        self,
+        submission_id: str,
+        request_hash: str,
+        response: dict,
+        created_at: Optional[str] = None,
     ) -> tuple[dict, bool]:
         """写入提交记录。返回 (记录, 是否由本次调用插入)。
 
         并发下同键写入由主键约束兜底，以首个落库结果为准。
+        created_at 缺省时取当前 UTC 时间；显式传入用于测试/回填场景。
         """
-        now = _utcnow()
+        now = created_at or _utcnow()
         inserted = False
         with self._lock, self._conn:
             try:

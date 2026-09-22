@@ -8,6 +8,10 @@
 在全部已注册参考字中按置信度返回 top-k 候选，通过全局一对一最优分配容忍书写次序差异，
 并把缺笔/多笔作为显式惩罚纳入总分。
 
+**练习质量趋势**（`GET /v1/analytics/practice`）：按字符、时间闭区间与通过状态筛选
+已保存的校验提交，在单次一致性快照中返回提交数、通过率、平均分、P50/P90 分数、
+首个失败笔画分布与按 UTC 日期分桶的趋势。
+
 ## 快速启动
 
 ### Docker Compose（推荐）
@@ -43,6 +47,7 @@ pytest tests/ -q
 | `POST` | `/v1/recognize` | 候选字识别：未标注轨迹 → top-k 候选 |
 | `POST` | `/v1/validate` | 校验一次书写提交（幂等） |
 | `GET` | `/v1/submissions/{submission_id}` | 按幂等键查询历史结果 |
+| `GET` | `/v1/analytics/practice` | 练习质量趋势：通过率/分位数/失败笔画分布/按日趋势 |
 
 ### 示例：候选字识别
 
@@ -181,6 +186,64 @@ curl -X POST http://localhost:8000/v1/validate \
 | `DIRECTION_DEVIATION` | 运笔方向偏差超限 |
 | `SHAPE_DEVIATION` | 笔画形状偏差超限 |
 
+### 示例：练习质量趋势
+
+```bash
+curl "http://localhost:8000/v1/analytics/practice?character=十&start=2026-09-20T00:00:00Z&end=2026-09-23T00:00:00Z"
+
+# 只看未通过的提交
+curl "http://localhost:8000/v1/analytics/practice?character=十&start=2026-09-20T00:00:00Z&end=2026-09-23T00:00:00Z&passed=false"
+```
+
+查询参数：
+
+| 参数 | 必填 | 说明 |
+| --- | --- | --- |
+| `character` | 是 | 目标汉字（单字） |
+| `start` / `end` | 是 | ISO-8601 时间，**闭区间**；带时区偏移时换算为 UTC，不带偏移按 UTC 处理；`start > end` 返回 `422` |
+| `passed` | 否 | `true`/`false` 只统计通过/未通过的提交；缺省不筛选 |
+
+响应（示例）：
+
+```json
+{
+  "filter": {
+    "character": "十",
+    "start": "2026-09-20T00:00:00Z",
+    "end": "2026-09-23T00:00:00Z",
+    "passed": null
+  },
+  "generated_at": "2026-09-22T08:30:00+00:00",
+  "submission_count": 5,
+  "passed_count": 2,
+  "pass_rate": 0.4,
+  "average_score": 60.0,
+  "p50_score": 60.0,
+  "p90_score": 92.0,
+  "first_failed_strokes": [
+    {"stroke_index": 0, "count": 1},
+    {"stroke_index": 1, "count": 2}
+  ],
+  "daily_trend": [
+    {"date": "2026-09-20", "submission_count": 2, "passed_count": 2,
+     "pass_rate": 1.0, "average_score": 90.0, "p50_score": 90.0, "p90_score": 98.0},
+    {"date": "2026-09-21", "submission_count": 2, "passed_count": 0,
+     "pass_rate": 0.0, "average_score": 50.0, "p50_score": 50.0, "p90_score": 58.0},
+    {"date": "2026-09-22", "submission_count": 1, "passed_count": 0,
+     "pass_rate": 0.0, "average_score": 20.0, "p50_score": 20.0, "p90_score": 20.0}
+  ]
+}
+```
+
+- 统计基于**单次加锁读取的一致性快照**，`filter` 回显实际生效的筛选条件，
+  `generated_at` 为响应生成的 UTC 时间；
+- `p50_score` / `p90_score` 采用**显式线性插值**：升序序列 `x_0..x_{n-1}`，
+  位置 `h = q·(n−1)`，取 `x_⌊h⌋ + (h−⌊h⌋)·(x_⌈h⌉ − x_⌊h⌋)`；
+- `first_failed_strokes` 只统计未通过提交，按笔画下标升序；
+- `daily_trend` 按 **UTC 日期**分桶、日期升序，仅包含有提交的日期，
+  每桶复用同一套汇总指标；
+- 无匹配提交时各数值为 `0`，`first_failed_strokes` 与 `daily_trend` 为空数组。
+
 ## 匹配算法
 
 1. **归一化**：以参考字外接框（扩成正方形 + 5% 边距）做仿射变换映射到 `0..1` 区间，
@@ -262,13 +325,14 @@ curl -X POST http://localhost:8000/v1/validate \
 
 ```
 app/
-├── main.py        # FastAPI 应用与路由（识别 + 幂等校验流程）
+├── main.py        # FastAPI 应用与路由（识别 + 幂等校验 + 练习趋势）
 ├── models.py      # Pydantic 请求/响应模型
 ├── recognition.py # 候选字识别引擎（代价矩阵 + 匈牙利全局一对一分配 + 缺/多笔惩罚）
 ├── validation.py  # 笔顺匹配引擎（方向/起止点/形状/错序/计分）
+├── analytics.py   # 练习质量趋势统计（线性插值分位数 + UTC 日期分桶）
 ├── geometry.py    # 归一化、重采样、拐点检测
-├── db.py          # SQLite 持久化（参考字 + 幂等提交）
+├── db.py          # SQLite 持久化（参考字 + 幂等提交 + 一致性快照查询）
 └── config.py      # 环境变量配置
-tests/test_api.py  # 31 个端到端用例
+tests/test_api.py  # 39 个端到端用例
 Dockerfile / docker-compose.yml
 ```

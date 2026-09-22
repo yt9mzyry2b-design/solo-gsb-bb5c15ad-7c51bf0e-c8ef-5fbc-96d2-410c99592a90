@@ -1,6 +1,7 @@
 """请求/响应模型（Pydantic v2）。"""
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Annotated, Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
@@ -212,3 +213,58 @@ class SubmissionRecord(BaseModel):
     request_hash: str
     result: ValidateResponse
     created_at: str
+
+
+# ------------------------------------------------------------ 练习质量趋势
+
+class PracticeAnalyticsFilter(BaseModel):
+    """本次统计实际生效的筛选条件（回显）。"""
+
+    character: str = Field(description="目标汉字")
+    start: datetime = Field(description="时间闭区间起点（UTC）")
+    end: datetime = Field(description="时间闭区间终点（UTC）")
+    passed: Optional[bool] = Field(
+        default=None, description="通过状态筛选；null 表示未筛选"
+    )
+
+
+class FirstFailedStrokeCount(BaseModel):
+    stroke_index: int = Field(description="首个失败笔画的下标（0 起）")
+    count: int = Field(ge=0, description="该下标作为首个失败笔画的提交数")
+
+
+class DailyTrendBucket(BaseModel):
+    """单个 UTC 日期桶的汇总指标（仅包含有提交的日期）。"""
+
+    date: str = Field(description="UTC 日期，YYYY-MM-DD")
+    submission_count: int = Field(ge=0)
+    passed_count: int = Field(ge=0)
+    pass_rate: float = Field(ge=0.0, le=1.0)
+    average_score: float = Field(ge=0.0, le=100.0)
+    p50_score: float = Field(ge=0.0, le=100.0)
+    p90_score: float = Field(ge=0.0, le=100.0)
+
+
+class PracticeAnalyticsResponse(BaseModel):
+    """书写练习质量趋势：基于单次一致性快照的汇总结果。
+
+    分数分位数（p50_score/p90_score）采用显式线性插值：
+    升序序列 x_0..x_{n-1}，位置 h = q·(n−1)，取
+    x_floor(h) + (h − floor(h))·(x_ceil(h) − x_floor(h))。
+    无匹配提交时各数值为 0，first_failed_strokes 与 daily_trend 为空数组。
+    """
+
+    filter: PracticeAnalyticsFilter
+    generated_at: str = Field(description="响应生成时间（UTC，ISO-8601）")
+    submission_count: int = Field(ge=0, description="匹配筛选条件的提交总数")
+    passed_count: int = Field(ge=0, description="其中通过的提交数")
+    pass_rate: float = Field(ge=0.0, le=1.0, description="通过率 passed/total")
+    average_score: float = Field(ge=0.0, le=100.0, description="平均分")
+    p50_score: float = Field(ge=0.0, le=100.0, description="分数 P50（线性插值）")
+    p90_score: float = Field(ge=0.0, le=100.0, description="分数 P90（线性插值）")
+    first_failed_strokes: list[FirstFailedStrokeCount] = Field(
+        description="未通过提交的首个失败笔画下标分布，按下标升序",
+    )
+    daily_trend: list[DailyTrendBucket] = Field(
+        description="按 UTC 日期分桶的趋势，日期升序，仅含有提交的日期",
+    )
